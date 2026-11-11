@@ -13,6 +13,10 @@ android {
         targetSdk = 34
         versionCode = 2
         versionName = "0.2"
+        ndk {
+            // 只保留 arm64，减小 APK 体积（Z50U / 小新 Pad 均为 arm64）
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     flavorDimensions += "device"
