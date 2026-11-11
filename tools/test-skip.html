@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>跳过测试</title>
+<style>
+  html,body{margin:0;height:100%;background:#101114;overflow:hidden}
+  .ad{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+      color:#fff;font:600 46px/1.2 sans-serif;background:linear-gradient(160deg,#1b2233,#3a2a1a)}
+  .skip{position:fixed;top:36px;right:36px;z-index:9;border:0;border-radius:999px;
+        padding:14px 30px;font:600 30px/1 sans-serif;background:#fff;color:#111;
+        box-shadow:0 6px 20px rgba(0,0,0,.4)}
+  #done{position:fixed;bottom:60px;left:40px;color:#7CFC9A;font:600 34px/1 sans-serif}
+</style>
+</head>
+<body>
+  <div class="ad">模拟开屏广告</div>
+  <button class="skip" onclick="document.getElementById('done').textContent='已跳过'">跳过</button>
+  <div id="done"></div>
+</body>
+</html>

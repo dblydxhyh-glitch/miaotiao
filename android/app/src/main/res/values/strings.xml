@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">秒跳</string>
+    <string name="accessibility_description">识别开屏广告的「跳过 / 关闭」按钮并点击，拦截摇一摇误跳转；红果短剧广告倒计时结束后自动上滑。</string>
+</resources>
