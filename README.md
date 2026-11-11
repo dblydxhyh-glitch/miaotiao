@@ -92,6 +92,7 @@ adb shell pm grant com.miaotiao.adskip.z50u android.permission.WRITE_SECURE_SETT
 
 - WebView 内部的广告不会产生包名跳转，识别不到
 - 摇一摇防护仅 Z50U / MyOS 可用；其他系统只能靠「拦截跳转」缓解
+- APK 只包含 arm64-v8a（Z50U、小新 Pad 均为 arm64）；32 位设备需修改 `app/build.gradle.kts` 的 `abiFilters` 后重新构建
 - 部分 ROM 需要关闭电池优化、允许自启动，否则无障碍会被杀
 - 免 root，不修改系统设置（自动恢复需要一次性 adb 授权）
 
