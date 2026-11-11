@@ -426,6 +426,7 @@ class SkipAccessibilityService : AccessibilityService() {
         if (pkg in currentSettings.excluded) return
         if (isSystemPkg(pkg)) return
         if (lastForegroundPkg != pkg) return
+        if (System.currentTimeMillis() - lastForegroundAt > 8_000) return
         if (skipOcrBusy) return
         val now = System.currentTimeMillis()
         if (lastSkipPkg == pkg && now - lastSkipAt < SKIP_COOLDOWN_MS) return
@@ -450,40 +451,7 @@ class SkipAccessibilityService : AccessibilityService() {
                             skipOcrBusy = false
                             return
                         }
-                        ocrRecognizer.process(InputImage.fromBitmap(full, 0))
-                            .addOnSuccessListener { result ->
-                                skipOcrBusy = false
-                                for (block in result.textBlocks) {
-                                    for (line in block.lines) {
-                                        val t = line.text.replace(Regex("\\s+"), "")
-                                        if (isSkipText(t) || t.contains("跳过")) {
-                                            val box = line.boundingBox
-                                            if (box != null) {
-                                                tapPoint(
-                                                    box.centerX().toFloat(),
-                                                    box.centerY().toFloat()
-                                                )
-                                                lastSkipAt = System.currentTimeMillis()
-                                                lastSkipPkg = pkg
-                                                DebugLog.log(
-                                                    applicationContext,
-                                                    "SKIP $pkg [ocr:$t]"
-                                                )
-                                                recordAction(pkg, "SKIP", "ocr:$t")
-                                                vibrateIfNeeded()
-                                                full.recycle()
-                                                return@addOnSuccessListener
-                                            }
-                                        }
-                                    }
-                                }
-                                full.recycle()
-                            }
-                            .addOnFailureListener { e ->
-                                skipOcrBusy = false
-                                DebugLog.log(applicationContext, "skip ocr fail ${e.message}")
-                                full.recycle()
-                            }
+                        ocrSkipRegions(full, 0, pkg)
                     }
 
                     override fun onFailure(errorCode: Int) {
@@ -495,6 +463,111 @@ class SkipAccessibilityService : AccessibilityService() {
         } catch (t: Throwable) {
             skipOcrBusy = false
             DebugLog.log(applicationContext, "skip screenshot error ${t.message}")
+        }
+    }
+
+    private fun ocrSkipBitmap(
+        bitmap: Bitmap,
+        offsetX: Int,
+        offsetY: Int,
+        scale: Float,
+        pkg: String,
+        onDone: (Boolean) -> Unit
+    ) {
+        ocrRecognizer.process(InputImage.fromBitmap(bitmap, 0))
+            .addOnSuccessListener { result ->
+                for (block in result.textBlocks) {
+                    for (line in block.lines) {
+                        val t = line.text.replace(Regex("\\s+"), "")
+                        if (t.contains("跳过")) {
+                            val box = line.boundingBox
+                            if (box != null) {
+                                tapPoint(
+                                    offsetX + box.centerX() / scale,
+                                    offsetY + box.centerY() / scale
+                                )
+                                lastSkipAt = System.currentTimeMillis()
+                                lastSkipPkg = pkg
+                                DebugLog.log(applicationContext, "SKIP $pkg [ocr:$t]")
+                                recordAction(pkg, "SKIP", "ocr:$t")
+                                vibrateIfNeeded()
+                                onDone(true)
+                                return@addOnSuccessListener
+                            }
+                        }
+                    }
+                }
+                onDone(false)
+            }
+            .addOnFailureListener { e ->
+                DebugLog.log(applicationContext, "skip ocr fail ${e.message}")
+                onDone(false)
+            }
+    }
+
+    private data class OcrRegion(
+        val left: Float,
+        val top: Float,
+        val right: Float,
+        val bottom: Float,
+        val scale: Float
+    )
+
+    private val SKIP_REGIONS = listOf(
+        OcrRegion(0.45f, 0f, 1f, 0.26f, 2f),   // 右上角（携程、全民K歌）
+        OcrRegion(0.40f, 0.72f, 1f, 1f, 2f),   // 右下角（微博）
+        OcrRegion(0f, 0f, 1f, 0.16f, 1.5f),    // 顶部整条（左上/中上）
+        OcrRegion(0f, 0.90f, 1f, 1f, 2f),      // 底栏
+        OcrRegion(0f, 0f, 1f, 1f, 1f)          // 整屏兜底
+    )
+
+    private fun ocrSkipRegions(full: Bitmap, index: Int, pkg: String) {
+        if (index >= SKIP_REGIONS.size) {
+            full.recycle()
+            skipOcrBusy = false
+            return
+        }
+        val region = SKIP_REGIONS[index]
+        if (region.scale == 1f && region.left == 0f && region.top == 0f) {
+            ocrSkipBitmap(full, 0, 0, 1f, pkg) { found ->
+                if (found) {
+                    full.recycle()
+                    skipOcrBusy = false
+                } else {
+                    ocrSkipRegions(full, index + 1, pkg)
+                }
+            }
+            return
+        }
+        try {
+            val left = (full.width * region.left).toInt()
+            val top = (full.height * region.top).toInt()
+            val w = (full.width * region.right).toInt() - left
+            val h = (full.height * region.bottom).toInt() - top
+            if (w <= 0 || h <= 0) {
+                ocrSkipRegions(full, index + 1, pkg)
+                return
+            }
+            val base = Bitmap.createBitmap(full, left, top, w, h)
+            val scaled = Bitmap.createScaledBitmap(
+                base,
+                (w * region.scale).toInt(),
+                (h * region.scale).toInt(),
+                true
+            )
+            base.recycle()
+            ocrSkipBitmap(scaled, left, top, region.scale, pkg) { found ->
+                scaled.recycle()
+                if (found) {
+                    full.recycle()
+                    skipOcrBusy = false
+                } else {
+                    ocrSkipRegions(full, index + 1, pkg)
+                }
+            }
+        } catch (t: Throwable) {
+            DebugLog.log(applicationContext, "skip crop error ${t.message}")
+            ocrSkipRegions(full, index + 1, pkg)
         }
     }
 
@@ -515,11 +588,15 @@ class SkipAccessibilityService : AccessibilityService() {
     private fun trySkip(pkg: String) {
         if (!currentSettings.autoSkip) return
         if (lastForegroundPkg != pkg) return
+        if (System.currentTimeMillis() - lastForegroundAt > 8_000) return
         val now = System.currentTimeMillis()
         if (now - lastSkipAt < SKIP_COOLDOWN_MS && lastSkipPkg == pkg) return
         val root = rootInActiveWindow ?: return
         val node = findSkipNode(root, 0) ?: return
-        val text = node.text?.toString() ?: node.contentDescription?.toString() ?: "跳过"
+        val text = node.text?.toString()?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: node.contentDescription?.toString()?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: node.viewIdResourceName?.substringAfterLast('/')
+            ?: "skip"
         var clickable: AccessibilityNodeInfo? = node
         var guard = 0
         while (clickable != null && !clickable.isClickable && guard < 5) {
@@ -538,10 +615,7 @@ class SkipAccessibilityService : AccessibilityService() {
 
     private fun findSkipNode(node: AccessibilityNodeInfo?, depth: Int): AccessibilityNodeInfo? {
         if (node == null || depth > 30) return null
-        val text = node.text?.toString() ?: node.contentDescription?.toString()
-        if (!text.isNullOrBlank() && isSkipText(text)) {
-            if (node.isClickable || node.isEnabled) return node
-        }
+        if (isSkipNode(node)) return node
         for (i in 0 until node.childCount) {
             val found = findSkipNode(node.getChild(i), depth + 1)
             if (found != null) return found
@@ -549,23 +623,40 @@ class SkipAccessibilityService : AccessibilityService() {
         return null
     }
 
-    private fun isSkipText(text: String): Boolean {
-        val t = text.replace(Regex("\\s+"), "")
-        if (t.length > 10) return false
-        if (t == "跳过" || t == "skip" || t == "Skip") return true
-        if (t.contains("跳过广告") || t.contains("关闭广告")) return true
-        if (Regex("^\\d+s?跳过$").matches(t)) return true
-        if (Regex("^跳过\\d+s?$").matches(t)) return true
+    private val SKIP_ID = Regex("(?i)(skip|splash_skip|ad_skip|close_ad)")
+    private val CLOSE_ID = Regex("(?i)(^|[/_])(close|iv_close|btn_close)")
+
+    private fun isSkipNode(node: AccessibilityNodeInfo): Boolean {
+        if (!node.isEnabled) return false
+        val text = node.text?.toString()?.trim().orEmpty()
+        val desc = node.contentDescription?.toString()?.trim().orEmpty()
+        val id = node.viewIdResourceName.orEmpty()
+        if (text.isNotEmpty() && isSkipText(text)) return true
+        if (desc.isNotEmpty() && isSkipText(desc)) return true
+        if (id.isNotEmpty() && SKIP_ID.containsMatchIn(id)) return true
+        // 只对「右上/右下」的 close 图标放宽，避免误关弹窗
+        if (id.isNotEmpty() && CLOSE_ID.containsMatchIn(id) && isTopOrRight(node)) {
+            return node.isClickable
+        }
         return false
     }
 
-    private fun isTopRight(node: AccessibilityNodeInfo): Boolean {
+    private fun isSkipText(text: String): Boolean {
+        val t = text.replace(Regex("\\s+"), "")
+        if (t.isEmpty() || t.length > 14) return false
+        if (t.contains("跳过")) return true
+        if (t.contains("关闭广告")) return true
+        if (t.equals("skip", true)) return true
+        return false
+    }
+
+    private fun isTopOrRight(node: AccessibilityNodeInfo): Boolean {
         val bounds = Rect()
         node.getBoundsInScreen(bounds)
         val metrics = getSystemService(WindowManager::class.java).currentWindowMetrics.bounds
         val cx = bounds.centerX().toFloat()
         val cy = bounds.centerY().toFloat()
-        return cx > metrics.width() * 0.5f && cy < metrics.height() * 0.45f
+        return cx > metrics.width() * 0.5f || cy < metrics.height() * 0.30f
     }
 
     // ---------------- 红果短剧自动化 ----------------
