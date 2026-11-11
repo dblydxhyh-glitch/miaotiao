@@ -22,6 +22,7 @@ import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.inputmethod.InputMethodManager
 import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationCompat
 import com.google.mlkit.vision.common.InputImage
@@ -232,6 +233,8 @@ class SkipAccessibilityService : AccessibilityService() {
 
     private fun handleForegroundChange(pkg: String, now: Long) {
         if (pkg == lastForegroundPkg) return
+        // 输入法窗口不是前台应用，忽略它的出现/消失，避免「输入法 -> 商城」误拦截
+        if (isImePackage(pkg)) return
         val previous = lastForegroundPkg
 
         // 摇一摇广告证据采集：普通 App → 浏览器/商店，8 秒内
@@ -402,8 +405,110 @@ class SkipAccessibilityService : AccessibilityService() {
         if (pkg in currentSettings.excluded) return
         if (isSystemPkg(pkg)) return
         val target = pkg
-        listOf(350L, 900L, 1600L, 2400L).forEach { delay ->
+        // 开屏广告可能延迟出现，持续扫描 8 秒；命中后有 8 秒冷却
+        var delay = 300L
+        while (delay <= 8_000L) {
             handler.postDelayed({ trySkip(target) }, delay)
+            delay += 500L
+        }
+        // 图片/视频广告无障碍树里没有「跳过」节点，用 OCR 兜底
+        for (d in listOf(1_500L, 2_800L, 4_100L)) {
+            handler.postDelayed({ trySkipByOcr(target) }, d)
+        }
+    }
+
+    private var skipOcrBusy = false
+    private var lastOcrSkipAt = 0L
+
+    private fun trySkipByOcr(pkg: String) {
+        if (!currentSettings.autoSkip) return
+        if (pkg == PACKAGE_HONGGUO || pkg == packageName) return
+        if (pkg in currentSettings.excluded) return
+        if (isSystemPkg(pkg)) return
+        if (lastForegroundPkg != pkg) return
+        if (skipOcrBusy) return
+        val now = System.currentTimeMillis()
+        if (lastSkipPkg == pkg && now - lastSkipAt < SKIP_COOLDOWN_MS) return
+        if (now - lastOcrSkipAt < 1_000) return
+        lastOcrSkipAt = now
+        skipOcrBusy = true
+        try {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        val full = try {
+                            Bitmap.wrapHardwareBuffer(
+                                screenshot.hardwareBuffer,
+                                screenshot.colorSpace
+                            )?.copy(Bitmap.Config.ARGB_8888, false)
+                        } finally {
+                            screenshot.hardwareBuffer.close()
+                        }
+                        if (full == null) {
+                            skipOcrBusy = false
+                            return
+                        }
+                        ocrRecognizer.process(InputImage.fromBitmap(full, 0))
+                            .addOnSuccessListener { result ->
+                                skipOcrBusy = false
+                                for (block in result.textBlocks) {
+                                    for (line in block.lines) {
+                                        val t = line.text.replace(Regex("\\s+"), "")
+                                        if (isSkipText(t) || t.contains("跳过")) {
+                                            val box = line.boundingBox
+                                            if (box != null) {
+                                                tapPoint(
+                                                    box.centerX().toFloat(),
+                                                    box.centerY().toFloat()
+                                                )
+                                                lastSkipAt = System.currentTimeMillis()
+                                                lastSkipPkg = pkg
+                                                DebugLog.log(
+                                                    applicationContext,
+                                                    "SKIP $pkg [ocr:$t]"
+                                                )
+                                                recordAction(pkg, "SKIP", "ocr:$t")
+                                                vibrateIfNeeded()
+                                                full.recycle()
+                                                return@addOnSuccessListener
+                                            }
+                                        }
+                                    }
+                                }
+                                full.recycle()
+                            }
+                            .addOnFailureListener { e ->
+                                skipOcrBusy = false
+                                DebugLog.log(applicationContext, "skip ocr fail ${e.message}")
+                                full.recycle()
+                            }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        skipOcrBusy = false
+                        DebugLog.log(applicationContext, "skip screenshot fail $errorCode")
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            skipOcrBusy = false
+            DebugLog.log(applicationContext, "skip screenshot error ${t.message}")
+        }
+    }
+
+    private fun tapPoint(x: Float, y: Float) {
+        try {
+            val path = Path().apply {
+                moveTo(x, y)
+                lineTo(x + 0.5f, y)
+            }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0L, 60L))
+                .build()
+            dispatchGesture(gesture, null, null)
+        } catch (_: Throwable) {
         }
     }
 
@@ -434,7 +539,7 @@ class SkipAccessibilityService : AccessibilityService() {
     private fun findSkipNode(node: AccessibilityNodeInfo?, depth: Int): AccessibilityNodeInfo? {
         if (node == null || depth > 30) return null
         val text = node.text?.toString() ?: node.contentDescription?.toString()
-        if (!text.isNullOrBlank() && isSkipText(text) && isTopRight(node)) {
+        if (!text.isNullOrBlank() && isSkipText(text)) {
             if (node.isClickable || node.isEnabled) return node
         }
         for (i in 0 until node.childCount) {
@@ -794,6 +899,20 @@ class SkipAccessibilityService : AccessibilityService() {
     private fun isBrowser(pkg: String): Boolean = pkg in BROWSER_ONLY
 
     private fun isStore(pkg: String): Boolean = pkg in STORE_PACKAGES
+
+    private val imePackages: Set<String> by lazy {
+        try {
+            getSystemService(InputMethodManager::class.java)
+                ?.enabledInputMethodList
+                ?.mapNotNull { it.packageName }
+                ?.toSet()
+                ?: emptySet()
+        } catch (_: Throwable) {
+            emptySet()
+        }
+    }
+
+    private fun isImePackage(pkg: String): Boolean = pkg in imePackages
 
     private fun isSystemPkg(pkg: String): Boolean =
         pkg == "android" || pkg.startsWith("com.android.") || pkg.startsWith("com.zte.") ||
